@@ -8,20 +8,50 @@ Requires: python3, brother_ql (on print host), requests
 """
 
 import json, time, subprocess, socket, logging, os, sys, hashlib
+import configparser
 import requests
 from datetime import datetime
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
-PLATFORM_API   = "http://20.125.62.35:8080"
-PLATFORM_TOKEN = "xk_T_zkKCiJ0irn8gBK6csrztp7rsNzKPcefXbVCxWc"
-PRINTER_IP     = "10.0.0.119"        # QL-810W WiFi
-PRINT_HOST     = "10.0.0.248"        # CTHome — where brother_ql runs (or this host)
-SUBNET         = "10.0.0"
-SCAN_INTERVAL  = 30                  # seconds between sweeps
+# Values come from autodiscovery.conf (same dir or /etc/ct/), falling back to
+# the defaults below so the script still runs standalone.
+_cfg = configparser.ConfigParser()
+_cfg.read([
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "autodiscovery.conf"),
+    "/etc/ct/autodiscovery.conf",
+])
+
+def _conf(section, key, default):
+    try:
+        return _cfg.get(section, key)
+    except (configparser.NoSectionError, configparser.NoOptionError):
+        return default
+
+PLATFORM_API   = _conf("discovery", "platform_api", "http://20.125.62.35:8080").rstrip("/")
+PLATFORM_TOKEN = _conf("discovery", "platform_token", os.environ.get("CT_PLATFORM_TOKEN", ""))
+PRINTER_IP     = _conf("discovery", "printer_ip", "10.0.0.119")      # QL-810W WiFi
+PRINT_HOST     = _conf("print", "print_host", "10.0.0.248")          # CTHome — where brother_ql runs
+SUBNET         = _conf("discovery", "subnet", "10.0.0")
+SCAN_INTERVAL  = int(_conf("discovery", "scan_interval", 30))        # seconds between sweeps
 CGMINER_PORT   = 4028
 CGMINER_TIMEOUT = 3
 STATE_FILE     = "/tmp/ct_discovered_miners.json"
-LOG_FILE       = "/var/log/ct_autodiscovery.log"
+LOG_FILE       = _conf("logging", "log_file", "/var/log/ct_autodiscovery.log")
+
+WARMUP_WAIT_MIN     = int(_conf("thresholds", "warmup_wait_min", 10))
+FAIL_NO_HASH_MIN    = int(_conf("thresholds", "fail_if_no_hash_after_min", 20))
+
+# Pools we operate — a primary pool whose URL matches none of these substrings
+# gets flagged so the platform GUI can prompt "tag to in-testing / a site?".
+KNOWN_POOLS = [p.strip().lower() for p in
+               _conf("discovery", "known_pools", "").split(",") if p.strip()]
+
+# Firmware families we allow on outgoing units. Anything else (e.g. vnish on
+# incoming bench units) is flagged needs_reflash so the platform can queue a
+# wipe + stock/Braiins/LuxOS install.
+APPROVED_FIRMWARE = [f.strip().lower() for f in
+                     _conf("discovery", "approved_firmware",
+                           "stock,braiins,luxos").split(",") if f.strip()]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,12 +68,50 @@ log = logging.getLogger("ct_autodiscovery")
 HEADERS = {"Authorization": f"Bearer {PLATFORM_TOKEN}", "Content-Type": "application/json"}
 
 # ── KNOWN MINER SIGNATURES ──────────────────────────────────────────────────
+# Longest-prefix match against the model string reported by the miner.
+# ideal_ths is the stock nameplate — used as a sanity reference, not a gate.
 MINER_MODELS = {
+    # Bitmain S19 family
     "Antminer S19k Pro": {"algo": "SHA-256", "ideal_ths": 120, "fans": 4, "chains": 3, "asics_per_chain": 77},
-    "Antminer S19 XP":   {"algo": "SHA-256", "ideal_ths": 141, "fans": 4, "chains": 3, "asics_per_chain": 76},
+    "Antminer S19j Pro+":{"algo": "SHA-256", "ideal_ths": 122, "fans": 4, "chains": 3, "asics_per_chain": 120},
+    "Antminer S19j Pro": {"algo": "SHA-256", "ideal_ths": 104, "fans": 4, "chains": 3, "asics_per_chain": 126},
+    "Antminer S19 XP":   {"algo": "SHA-256", "ideal_ths": 141, "fans": 4, "chains": 3, "asics_per_chain": 110},
+    "Antminer S19 Pro":  {"algo": "SHA-256", "ideal_ths": 110, "fans": 4, "chains": 3, "asics_per_chain": 114},
+    "Antminer S19":      {"algo": "SHA-256", "ideal_ths": 95,  "fans": 4, "chains": 3, "asics_per_chain": 76},
+    # Bitmain S21/T21 family (2024-2026)
+    "Antminer S21 XP":   {"algo": "SHA-256", "ideal_ths": 270, "fans": 4, "chains": 3, "asics_per_chain": 216},
+    "Antminer S21 Pro":  {"algo": "SHA-256", "ideal_ths": 234, "fans": 4, "chains": 3, "asics_per_chain": 216},
+    "Antminer S21+":     {"algo": "SHA-256", "ideal_ths": 216, "fans": 4, "chains": 3, "asics_per_chain": 216},
+    "Antminer S21e":     {"algo": "SHA-256", "ideal_ths": 195, "fans": 4, "chains": 3, "asics_per_chain": 216},
+    "Antminer S21":      {"algo": "SHA-256", "ideal_ths": 200, "fans": 4, "chains": 3, "asics_per_chain": 216},
+    "Antminer T21":      {"algo": "SHA-256", "ideal_ths": 190, "fans": 4, "chains": 3, "asics_per_chain": 216},
+    # Bitmain other algos
     "Antminer L7":       {"algo": "Scrypt",  "ideal_ghs": 9.16,"fans": 4, "chains": 1, "asics_per_chain": 0},
-    "MicroBT WhatsMiner": {"algo": "SHA-256","ideal_ths": 103, "fans": 2, "chains": 3, "asics_per_chain": 156},
+    "Antminer L9":       {"algo": "Scrypt",  "ideal_ghs": 16,  "fans": 4, "chains": 1, "asics_per_chain": 0},
+    # MicroBT WhatsMiner (M3x/M5x/M6x) — model strings look like "M66S+VK30" etc.
+    "WhatsMiner M66S++": {"algo": "SHA-256", "ideal_ths": 348, "fans": 0, "chains": 3, "asics_per_chain": 0},  # hydro
+    "WhatsMiner M66S+":  {"algo": "SHA-256", "ideal_ths": 318, "fans": 0, "chains": 3, "asics_per_chain": 0},  # hydro
+    "WhatsMiner M66S":   {"algo": "SHA-256", "ideal_ths": 298, "fans": 0, "chains": 3, "asics_per_chain": 0},  # hydro
+    "WhatsMiner M66":    {"algo": "SHA-256", "ideal_ths": 276, "fans": 0, "chains": 3, "asics_per_chain": 0},  # hydro
+    "WhatsMiner M56S":   {"algo": "SHA-256", "ideal_ths": 212, "fans": 0, "chains": 3, "asics_per_chain": 0},  # hydro
+    "WhatsMiner M56":    {"algo": "SHA-256", "ideal_ths": 194, "fans": 0, "chains": 3, "asics_per_chain": 0},  # hydro
+    "WhatsMiner M60S":   {"algo": "SHA-256", "ideal_ths": 186, "fans": 2, "chains": 3, "asics_per_chain": 0},
+    "WhatsMiner M60":    {"algo": "SHA-256", "ideal_ths": 172, "fans": 2, "chains": 3, "asics_per_chain": 0},
+    "WhatsMiner M50S":   {"algo": "SHA-256", "ideal_ths": 126, "fans": 2, "chains": 3, "asics_per_chain": 0},
+    "WhatsMiner M50":    {"algo": "SHA-256", "ideal_ths": 114, "fans": 2, "chains": 3, "asics_per_chain": 135},
+    "WhatsMiner M30S":   {"algo": "SHA-256", "ideal_ths": 100, "fans": 2, "chains": 3, "asics_per_chain": 148},
+    "MicroBT WhatsMiner":{"algo": "SHA-256", "ideal_ths": 103, "fans": 2, "chains": 3, "asics_per_chain": 156},
 }
+
+def match_model(model_str: str) -> dict:
+    """Longest-prefix match of a reported model string against MINER_MODELS."""
+    m = (model_str or "").strip()
+    best = None
+    for name in MINER_MODELS:
+        if m.lower().startswith(name.lower()) or name.lower() in m.lower():
+            if best is None or len(name) > len(best):
+                best = name
+    return {"match": best, **MINER_MODELS.get(best, {})} if best else {}
 
 # ── NETWORK DISCOVERY ───────────────────────────────────────────────────────
 def scan_cgminer_port(ip: str) -> bool:
@@ -112,6 +180,33 @@ def get_stats(ip: str) -> dict:
         pass
     return {}
 
+# ── FIRMWARE DETECTION ──────────────────────────────────────────────────────
+def detect_firmware(ver: dict | None, web: dict | None = None) -> tuple[str, str]:
+    """
+    Classify the firmware family running on a miner from its cgminer/btminer
+    `version` response (plus web info when available).
+
+    Returns (family, version_string) where family is one of:
+      stock | braiins | luxos | vnish | unknown
+    """
+    if not ver:
+        return "unknown", ""
+    v = ver.get("VERSION", [{}])[0]
+    blob = (json.dumps(ver) + json.dumps(web or {})).lower()
+
+    if "bosminer" in blob or "braiins" in blob or "bos+" in blob:
+        return "braiins", str(v.get("BOSminer", v.get("BOSer", v.get("bosminer", ""))))
+    if "luxminer" in blob or "luxos" in blob:
+        return "luxos", str(v.get("LUXminer", ""))
+    if "vnish" in blob:
+        # Vnish typically appends itself to Type, e.g. "Antminer S19 (Vnish 1.2.6)"
+        return "vnish", str(v.get("Type", ""))
+    if "btminer" in blob or "whatsminer" in blob:
+        return "stock", str(v.get("BTMiner", v.get("API", "")))       # MicroBT stock
+    if "bmminer" in blob or "cgminer" in blob or "antminer" in blob:
+        return "stock", str(v.get("BMMiner", v.get("CGMiner", "")))   # Bitmain stock
+    return "unknown", str(v.get("Type", ""))
+
 # ── DIAGNOSTICS ─────────────────────────────────────────────────────────────
 def run_diagnostics(ip: str) -> dict:
     """Full diagnostic run on a newly discovered miner."""
@@ -149,6 +244,22 @@ def run_diagnostics(ip: str) -> dict:
     if web.get("model"):  result["model"]  = web["model"]
     if web.get("mac"):    result["mac"]    = web["mac"]
 
+    # Firmware family (stock / braiins / luxos / vnish / unknown)
+    fw_family, fw_version = detect_firmware(ver, web)
+    result["firmware_type"]    = fw_family
+    result["firmware_version"] = fw_version
+    result["needs_reflash"]    = fw_family not in APPROVED_FIRMWARE
+    if result["needs_reflash"]:
+        result["symptoms"].append(
+            f"Firmware '{fw_family}' not approved — wipe & reflash "
+            f"({'/'.join(APPROVED_FIRMWARE)}) before shipping")
+
+    # Model signature match (S21 family, WhatsMiner M5x/M6x, etc.)
+    sig = match_model(result["model"])
+    if sig:
+        result["model_match"]  = sig.get("match")
+        result["ideal_ths_spec"] = sig.get("ideal_ths", 0)
+
     # Get summary
     summ = query_cgminer(ip, "summary")
     if summ:
@@ -165,6 +276,14 @@ def run_diagnostics(ip: str) -> dict:
         result["pool"]   = p0.get("URL", "")
         result["worker"] = p0.get("User", "")
         result["pool_status"] = p0.get("Status", "")
+
+    # Pool recognition — unknown pool means the unit arrived with a customer /
+    # previous-owner config. Flag it so the GUI can prompt: tag to in-testing
+    # pool or a site, and remember the choice for the batch.
+    pool_url = (result.get("pool") or "").lower()
+    result["pool_known"] = (not KNOWN_POOLS) or any(k in pool_url for k in KNOWN_POOLS)
+    if pool_url and not result["pool_known"]:
+        result["symptoms"].append(f"Unrecognized pool: {result['pool']} — needs tagging (in-testing or site)")
 
     # Get stats (fans + chains) — Antminer HTTP
     stats = get_stats(ip)
@@ -281,7 +400,30 @@ def get_or_create_miner(diag: dict) -> tuple[str, str]:
     r = requests.get(f"{PLATFORM_API}/miners", headers=HEADERS, timeout=5)
     miners = r.json().get("miners", r.json() if isinstance(r.json(), list) else [])
 
-    existing = next((m for m in miners if m.get("ip_address") == diag["ip"]), None)
+    # Match by durable identity first — IPs on the bench are DHCP and get
+    # reused between units, which used to hand a new miner the previous
+    # unit's CT ID (and print the wrong label). Serial > MAC > IP.
+    serial = (diag.get("serial") or "").strip()
+    mac    = (diag.get("mac") or "").strip().upper()
+    existing = None
+    if serial:
+        existing = next((m for m in miners if (m.get("serial") or "").strip() == serial), None)
+    if not existing and mac and mac != "00:00:00:00:00:00":
+        existing = next((m for m in miners if (m.get("mac") or "").strip().upper() == mac), None)
+    if not existing:
+        ip_match = next((m for m in miners if m.get("ip_address") == diag["ip"]), None)
+        # Only trust an IP match when identities don't contradict it.
+        if ip_match:
+            m_serial = (ip_match.get("serial") or "").strip()
+            m_mac    = (ip_match.get("mac") or "").strip().upper()
+            serial_conflict = bool(serial and m_serial and m_serial != serial)
+            mac_conflict    = bool(mac and mac != "00:00:00:00:00:00"
+                                   and m_mac and m_mac != mac)
+            if serial_conflict or mac_conflict:
+                log.warning(f"  IP {diag['ip']} matches {ip_match.get('name')} but "
+                            f"serial/MAC differ — treating as a NEW miner (IP reuse)")
+            else:
+                existing = ip_match
     if existing:
         return existing["id"], existing.get("name", "CT-????")
 
@@ -300,6 +442,10 @@ def get_or_create_miner(diag: dict) -> tuple[str, str]:
         "ip_address": diag["ip"],
         "model": diag.get("model", "Unknown"),
         "pool_user": diag.get("worker", ""),
+        "serial": diag.get("serial", ""),
+        "mac": diag.get("mac", ""),
+        "firmware_type": diag.get("firmware_type", "unknown"),
+        "firmware_version": diag.get("firmware_version", ""),
     }
     r = requests.post(f"{PLATFORM_API}/miners", headers=HEADERS, json=payload, timeout=5)
     miner_id = r.json().get("miner", {}).get("id", "")
@@ -316,6 +462,12 @@ def push_telemetry(miner_id: str, diag: dict):
         "rejected_shares": 0,
         "uptime_seconds": diag.get("elapsed", 0),
         "status": diag.get("test_result", "PENDING"),
+        "firmware_type": diag.get("firmware_type", "unknown"),
+        "firmware_version": diag.get("firmware_version", ""),
+        "needs_reflash": diag.get("needs_reflash", False),
+        "pool_url": diag.get("pool", ""),
+        "pool_known": diag.get("pool_known", True),
+        "serial": diag.get("serial", ""),
     }
     try:
         requests.post(f"{PLATFORM_API}/miners/{miner_id}/telemetry",
@@ -324,10 +476,13 @@ def push_telemetry(miner_id: str, diag: dict):
         pass
 
 # ── PRINT TRIGGER ─────────────────────────────────────────────────────────────
-def trigger_print(diag: dict, ct_id: str):
-    """Trigger label print — either locally or via SSH to CTHome."""
-    import tempfile
+PRINT_USER     = _conf("print", "print_user", "ctadmin")
+PRINT_SSH_PORT = _conf("print", "print_ssh_port", "22")
 
+def trigger_print(diag: dict, ct_id: str):
+    """Trigger label print — locally if brother_ql is installed, else via SSH
+    to the print host. Retries up to 3 times; label leads with CT ID + serial
+    so the sticker is unambiguous about which physical unit it belongs to."""
     script = f"""
 import sys, os, datetime, qrcode
 sys.path.insert(0, os.path.expanduser("~/Library/Python/3.9/lib/python/site-packages"))
@@ -357,8 +512,8 @@ def gf(size):
 
 fBIG=gf(32); fMED=gf(26); fSML=gf(21); fTINY=gf(16)
 
-qr_mod = qrcode.QRCode(version=2,box_size=3,border=1)
-qr_mod.add_data("CT:{ct_id}|IP:{diag['ip']}|MAC:{diag['mac']}|MODEL:{diag['model']}|"+NOW)
+qr_mod = qrcode.QRCode(version=3,box_size=3,border=1)
+qr_mod.add_data("CT:{ct_id}|SN:{diag.get('serial','')}|IP:{diag['ip']}|MAC:{diag['mac']}|MODEL:{diag['model']}|"+NOW)
 qr_mod.make(fit=True)
 qr_img = qr_mod.make_image(fill_color="black",back_color="white").convert("RGB").resize((88,88))
 
@@ -370,9 +525,9 @@ d.rectangle([0,0,W-1,H-1],outline="black",width=5)
 # Header
 d.rectangle([0,0,W,88],fill="black")
 img.paste(qr_img,(6,2))
-d.text((102,6),"CRYPTOTHERM TESTING",font=fBIG,fill="white")
-d.text((102,42),"Auto-Discovered Miner",font=fMED,fill="#cccccc")
-d.text((102,68),"{ct_id}  |  "+NOW,font=fTINY,fill="#aaaaaa")
+d.text((102,6),"{ct_id}",font=fBIG,fill="white")
+d.text((102,42),"SN {diag.get('serial') or 'UNKNOWN — SCAN UNIT'}",font=fMED,fill="#ffffff")
+d.text((102,68),"CRYPTOTHERM TESTING  |  "+NOW,font=fTINY,fill="#aaaaaa")
 
 # Result banner
 result="{diag['test_result']}"
@@ -381,14 +536,14 @@ d.text((14,98),"TEST: "+result,font=fBIG,fill="white")
 
 y=150
 rows=[
+    ("SERIAL", "{diag.get('serial') or '? — SCAN UNIT'}"),
     ("MODEL",  "{diag['model']}"),
+    ("FW",     "{diag.get('firmware_type','?')} {diag.get('firmware_version','')}"),
     ("IP",     "{diag['ip']}"),
     ("MAC",    "{diag['mac']}"),
-    ("SERIAL", "{diag.get('serial','?')}"),
     ("POOL",   "{diag.get('worker','?')}"),
     ("HASH",   "%.1f GH/s" % float({diag.get('hashrate_5s',0)})),
-    ("SHARES", "Acc:{diag.get('accepted',0)}"),
-    ("HEALTH", "{diag.get('health',0)}/100"),
+    ("SHARES", "Acc:{diag.get('accepted',0)}  |  HEALTH {diag.get('health',0)}/100"),
 ]
 for lbl,val in rows:
     d.text((12,y),lbl+":",font=fSML,fill="#555555")
@@ -412,28 +567,42 @@ send(instructions=qlr.data,printer_identifier=PRINTER,backend_identifier="networ
 print("PRINTED OK: {ct_id}")
 """
 
-    # Write temp script and run via SSH on MacBook (has brother_ql)
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-            f.write(script)
-            tmp = f.name
+    # Run locally if brother_ql is available, else pipe the script over SSH
+    # to the print host's stdin (`python3 -`). The old code passed both
+    # input= and stdin= to subprocess.run — a ValueError on every call — and
+    # told the remote shell to read a temp file that only existed locally,
+    # so SSH printing never worked.
+    serial = diag.get("serial") or "no-serial"
+    have_local = subprocess.run(
+        ["python3", "-c", "import brother_ql"], capture_output=True).returncode == 0
 
-        # Try local first, then SSH to MacBook
-        if subprocess.run(["python3", "-c", "import brother_ql"], capture_output=True).returncode == 0:
-            subprocess.run(["python3", tmp], timeout=30)
-        else:
-            # SSH to MacBook via tunnel
-            subprocess.run([
-                "ssh", "-i", "/home/work/.ssh/id_ed25519",
-                "-o", "StrictHostKeyChecking=no", "-p", "2220",
-                "austinbank@localhost",
-                f"export PATH=$HOME/Library/Python/3.9/bin:$PATH; python3 < {tmp}"
-            ], input=open(tmp).read().encode(), timeout=30,
-               stdin=subprocess.PIPE)
-        os.unlink(tmp)
-        log.info(f"  Label printed for {ct_id}")
-    except Exception as e:
-        log.error(f"  Print failed: {e}")
+    for attempt in range(1, 4):
+        try:
+            if have_local:
+                proc = subprocess.run(["python3", "-"], input=script.encode(),
+                                      capture_output=True, timeout=60)
+            else:
+                proc = subprocess.run([
+                    "ssh", "-o", "StrictHostKeyChecking=no",
+                    "-o", "ConnectTimeout=10", "-p", str(PRINT_SSH_PORT),
+                    f"{PRINT_USER}@{PRINT_HOST}",
+                    "export PATH=$HOME/Library/Python/3.9/bin:$PATH; python3 -",
+                ], input=script.encode(), capture_output=True, timeout=60)
+
+            out = proc.stdout.decode(errors="ignore")
+            if proc.returncode == 0 and "PRINTED OK" in out:
+                log.info(f"  Label printed: {ct_id} (SN {serial})")
+                return
+            err = proc.stderr.decode(errors="ignore").strip().splitlines()
+            log.warning(f"  Print attempt {attempt}/3 failed for {ct_id} "
+                        f"(SN {serial}): rc={proc.returncode} "
+                        f"{err[-1] if err else out.strip()[-200:]}")
+        except Exception as e:
+            log.warning(f"  Print attempt {attempt}/3 error for {ct_id} (SN {serial}): {e}")
+        time.sleep(5 * attempt)
+
+    log.error(f"  PRINT FAILED after 3 attempts: {ct_id} (SN {serial}) — "
+              f"check printer {PRINTER_IP} and print host {PRINT_HOST}")
 
 # ── STATE MANAGEMENT ──────────────────────────────────────────────────────────
 def load_state() -> dict:
@@ -483,33 +652,62 @@ def main():
                     log.info(f"NEW MINER DETECTED: {ip} (MAC: {mac})")
                     diag = run_diagnostics(ip)
 
-                    # Wait up to 15 min for warmup if pending
-                    if diag["test_result"] == "PENDING":
-                        log.info(f"  Miner warming up — waiting 10 min before final diagnosis...")
-                        time.sleep(600)
-                        diag = run_diagnostics(ip)
-
+                    # Register + push telemetry right away so the platform
+                    # sees the unit, but DON'T block the scan loop on warmup
+                    # — the old 10-min sleep here stalled discovery and
+                    # printing for every other miner on the bench.
                     miner_id, ct_id = get_or_create_miner(diag)
                     push_telemetry(miner_id, diag)
 
                     diag["ct_id"] = ct_id
                     diag["miner_id"] = miner_id
                     state[fp] = {
-                        "ct_id": ct_id, "ip": ip, "mac": mac,
+                        "ct_id": ct_id, "miner_id": miner_id,
+                        "ip": ip, "mac": mac,
+                        "serial": diag.get("serial",""),
                         "test_result": diag["test_result"],
                         "model": diag.get("model","?"),
+                        "firmware_type": diag.get("firmware_type","unknown"),
                         "first_seen": datetime.now().isoformat(),
                         "last_seen": datetime.now().isoformat(),
+                        "label_printed": False,
                     }
+
+                    if diag["test_result"] == "PENDING":
+                        log.info(f"  {ct_id} warming up — will re-check on next sweeps (no label yet)")
+                    else:
+                        log.info(f"  Printing CT label for {ct_id}...")
+                        trigger_print(diag, ct_id)
+                        state[fp]["label_printed"] = True
                     save_state(state)
 
-                    # Print label
-                    log.info(f"  Printing CT label for {ct_id}...")
-                    trigger_print(diag, ct_id)
-
                 else:
-                    # Known miner — update last seen
-                    state[fp]["last_seen"] = datetime.now().isoformat()
+                    # Known miner — update last seen; finish any pending warmup
+                    entry = state[fp]
+                    entry["last_seen"] = datetime.now().isoformat()
+
+                    if entry.get("test_result") == "PENDING":
+                        diag = run_diagnostics(ip)
+                        waited_min = (datetime.now() -
+                                      datetime.fromisoformat(entry["first_seen"])).total_seconds() / 60
+
+                        # Give up waiting: no hash after the configured window
+                        if diag["test_result"] == "PENDING" and waited_min >= FAIL_NO_HASH_MIN:
+                            diag["test_result"] = "FAIL"
+                            diag["fault_code"]  = "NO-HASH-TIMEOUT"
+                            diag["fault_title"] = f"No hashrate after {waited_min:.0f} min"
+                            diag["health"] = 20
+
+                        if diag["test_result"] != "PENDING":
+                            ct_id = entry.get("ct_id", "CT-????")
+                            diag["ct_id"] = ct_id
+                            push_telemetry(entry.get("miner_id",""), diag)
+                            entry["test_result"] = diag["test_result"]
+                            entry["serial"] = diag.get("serial", entry.get("serial",""))
+                            if not entry.get("label_printed"):
+                                log.info(f"  {ct_id} warmup complete ({diag['test_result']}) — printing label...")
+                                trigger_print(diag, ct_id)
+                                entry["label_printed"] = True
                     save_state(state)
 
         except KeyboardInterrupt:
