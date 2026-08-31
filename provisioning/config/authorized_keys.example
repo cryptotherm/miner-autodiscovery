@@ -1,0 +1,11 @@
+# Paste your ADMIN PUBLIC keys here (one per line), then save this file as
+#   authorized_keys   (drop the .example).
+#
+# These are PUBLIC keys — safe to carry on the USB.  They let your admin
+# machines SSH INTO any box you onboard.  Do NOT put private keys here.
+#
+# Get a machine's public key with:   cat ~/.ssh/id_ed25519.pub
+# (or the .pub that matches whatever key your admins use to connect).
+#
+# Example line (replace with your real key):
+# ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...replace-me... ct-admin@cthome

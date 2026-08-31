@@ -1,0 +1,7 @@
+# Never commit real secrets from the provisioning kit.
+config/provision.conf
+config/authorized_keys
+config/id_ct
+config/id_ct.*
+config/*.key
+config/*.pem
