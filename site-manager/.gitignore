@@ -3,3 +3,5 @@ mine-manager.conf
 mine-manager-state.json
 mine-manager-audit.log
 reports/
+__pycache__/
+*.pyc
