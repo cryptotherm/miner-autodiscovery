@@ -1,0 +1,39 @@
+CRYPTOTHERM ONBOARDING USB  —  START HERE
+==========================================
+
+This stick preps a NEW computer to join the Cryptotherm ecosystem:
+  • installs an SSH server
+  • installs Tailscale and joins your tailnet
+  • authorizes your admin key so you can SSH in afterward
+
+There is no true "autorun" on modern computers (disabled for security),
+so pick your OS below and run the one file.
+
+------------------------------------------------------------------
+ONE-TIME PREP (do this once, on any machine, before onboarding):
+------------------------------------------------------------------
+1. Open the  config  folder.
+2. Copy  provision.conf.example  ->  provision.conf  and fill in your
+   Tailscale auth key (make one at
+   https://login.tailscale.com/admin/settings/keys ).
+3. Copy  authorized_keys.example  ->  authorized_keys  and paste your
+   admin PUBLIC key(s) into it.
+   (Public keys only — never put a private key on this stick.)
+
+------------------------------------------------------------------
+ONBOARD A COMPUTER:
+------------------------------------------------------------------
+WINDOWS : open the  windows  folder, double-click
+          RUN-provision-windows.bat  (click "Yes" to the admin prompt).
+
+macOS   : open Terminal, then run:
+          bash /Volumes/<USB-NAME>/mac/provision-mac.sh
+
+LINUX   : open a terminal, then run:
+          sudo bash /media/<you>/<USB-NAME>/linux/provision-linux.sh
+
+------------------------------------------------------------------
+AFTER THE BATCH:
+------------------------------------------------------------------
+Revoke the Tailscale auth key in the admin console so a lost stick
+can't add machines. See README.md for full details & security notes.

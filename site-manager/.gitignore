@@ -1,0 +1,12 @@
+# Never commit site secrets or runtime state.
+mine-manager.conf
+mine-manager-state.json
+mine-manager-audit.log
+mine-manager.db
+mine-manager.db-wal
+mine-manager.db-shm
+mine-manager.out.log
+run-mine-manager.cmd
+reports/
+__pycache__/
+*.pyc
