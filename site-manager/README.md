@@ -50,18 +50,74 @@ Every reboot / pool change is appended to `mine-manager-audit.log`.
 
 ## Install
 
-On an always-on Linux box at the site (Pi / mini-PC / NUC), on the miner LAN:
+Runs on **Windows** (your sites) or Linux. Put it on an always-on box on the
+miner LAN.
+
+### Windows (site default)
+
+```powershell
+# elevated PowerShell, from the site-manager folder
+Set-ExecutionPolicy Bypass -Scope Process -Force
+.\install-site-manager.ps1        # installs Python deps + a boot scheduled task
+# then edit C:\CT\mine-manager\mine-manager.conf  (subnet, notify, thresholds)
+& python C:\CT\mine-manager\mine-manager.py status   # sanity check
+Start-ScheduledTask -TaskName 'CT Mine Manager'
+Get-Content C:\CT\mine-manager\mine-manager.out.log -Wait
+```
+
+Secrets go in **machine** environment variables (not the repo):
+`setx /M CT_MINER_PASS ...`, `CT_SMTP_PASS`, `CT_SERVER_TOKEN`, `CT_PLATFORM_TOKEN`.
+
+### Linux
 
 ```bash
 cd site-manager
-cp mine-manager.conf.example mine-manager.conf   # then EDIT: subnet, notify, thresholds
-sudo bash install-site-manager.sh                # installs a systemd service (does not auto-start)
+cp mine-manager.conf.example mine-manager.conf   # EDIT: subnet, notify, thresholds
+sudo bash install-site-manager.sh                # systemd service (does not auto-start)
 sudo systemctl start ct-mine-manager
 journalctl -u ct-mine-manager -f
 ```
 
-Put secrets in the service environment, never in the repo:
-`CT_MINER_PASS`, `CT_SMTP_PASS`, `CT_PLATFORM_TOKEN` (see the unit file).
+Secrets go in the service environment (see the unit file).
+
+## Per-miner history (MAC-keyed)
+
+Every sweep writes a time-series **sample** per miner to a local SQLite DB
+(`storage.db`), keyed by **MAC address** (stable identity across IP changes),
+plus an `events` log (issue open/clear, reboots, pool changes). Each sample
+captures hashrate, ideal, temp, **power (watts)**, shares, state, and issue —
+the full history the server/dashboard and the billing model need.
+
+```bash
+python3 mine-manager.py history AA:BB:CC:DD:EE:FF      # recent samples for a miner
+```
+
+Set `storage.server_push_url` to also forward every sweep to a central server
+(e.g. Cole's dashboard backend), so history is queryable server-side rather
+than only on each site box. Off by default; it does **not** stand up a new
+server — point it at the existing one.
+
+## Billing (power per client)
+
+Assign each miner to a client, then bill by integrating power over time:
+
+```bash
+python3 mine-manager.py assign AA:BB:CC:DD:EE:FF --client "Acme" --rated-watts 3010
+python3 mine-manager.py bill --from 2026-09-01 --to 2026-10-01     # kWh + $ per client
+python3 mine-manager.py bill --json                                # machine-readable
+```
+
+Power is **measured** when the miner's API reports watts, otherwise **estimated**
+from a rough nameplate table. `estimate_power()` in `mine-manager.py` is the
+**drop-in hook for Graeson's ML power model** — replace it and every sample +
+bill uses the ML estimate automatically. `billing.rate_per_kwh` sets the price.
+
+## Remote management
+
+The site box joins Tailscale (via the onboarding USB kit), so you manage it
+remotely by SSHing in and running any subcommand (`status`, `restart <ip>`,
+`bill`, etc.). For dashboard-driven control, `server_push_url` feeds the
+server; a control API can be added once Cole's dashboard contract is known.
 
 ## Run it by hand
 

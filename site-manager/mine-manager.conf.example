@@ -55,6 +55,22 @@ interval_hours = 6
 dir            = ./reports
 deliver        = false        # also push each report to the notify channels
 
+[storage]
+# Per-miner history is kept in a local SQLite DB, keyed by MAC (stable identity),
+# so every miner has a full time-series (hashrate, temp, power, faults).
+db                    = ./mine-manager.db
+# Optional: forward every sweep to a central server (e.g. Cole's dashboard
+# backend) so history is queryable server-side. Leave blank to keep local-only.
+server_push_url       =
+server_push_token_env = CT_SERVER_TOKEN   # env var holding the server bearer token
+
+[billing]
+# Power consumed per miner is integrated from the samples above, grouped by the
+# client each miner is assigned to (see: mine-manager.py assign <mac> --client X).
+# Power is measured when the miner reports watts, otherwise estimated by model
+# (rough) — Graeson's ML power model is the intended drop-in (see estimate_power).
+rate_per_kwh = 0.10           # $/kWh used for cost; override per contract
+
 [platform]
 # Optional: push telemetry to the Cryptotherm platform API.
 enabled   = false

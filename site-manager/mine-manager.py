@@ -34,8 +34,10 @@ import configparser
 import json
 import logging
 import os
+import platform
 import smtplib
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -56,7 +58,17 @@ DEFAULTS = {
     "notify":     {"webhook_url": "", "min_severity": "warning", "email_to": "",
                    "smtp_host": "", "smtp_port": "587", "smtp_user": "", "smtp_pass_env": "CT_SMTP_PASS"},
     "reports":    {"enabled": "true", "interval_hours": "6", "dir": "./reports", "deliver": "false"},
+    "storage":    {"db": "./mine-manager.db", "server_push_url": "", "server_push_token_env": "CT_SERVER_TOKEN"},
+    "billing":    {"rate_per_kwh": "0.10"},
     "platform":   {"enabled": "false", "api": "", "token_env": "CT_PLATFORM_TOKEN"},
+}
+
+# Approximate nameplate wattage by model substring. These are ROUGH — they are
+# only a fallback when a miner reports no power and no ML estimate is available.
+# Graeson's ML power model is the intended replacement (see estimate_power()).
+RATED_WATTS = {
+    "S19k Pro": 2760, "S19 XP": 3010, "S19j Pro": 3050, "S19": 3250,
+    "L7": 3425, "S21": 3500, "T21": 3610, "WhatsMiner": 3400, "M30": 3400, "M50": 3300,
 }
 
 
@@ -133,14 +145,73 @@ def query_cgminer(ip: str, command: str, port: int, parameter: str | None = None
 
 
 def get_mac(ip: str) -> str:
+    """MAC from the ARP table. Cross-platform (Windows 'arp -a' uses dashes)."""
     try:
-        r = subprocess.run(["arp", "-n", ip], capture_output=True, text=True, timeout=3)
-        for part in r.stdout.split():
-            if ":" in part and len(part) == 17:
-                return part.upper()
+        if platform.system() == "Windows":
+            r = subprocess.run(["arp", "-a", ip], capture_output=True, text=True, timeout=3)
+            for tok in r.stdout.replace("-", ":").split():
+                if tok.count(":") == 5 and len(tok) == 17:
+                    return tok.upper()
+        else:
+            r = subprocess.run(["arp", "-n", ip], capture_output=True, text=True, timeout=3)
+            for tok in r.stdout.split():
+                if tok.count(":") == 5 and len(tok) == 17:
+                    return tok.upper()
     except Exception:  # noqa: BLE001
         pass
     return "00:00:00:00:00:00"
+
+
+def get_ident(ip: str, auth: HTTPDigestAuth) -> dict:
+    """Stable identity (MAC + serial + model) from the Antminer web API."""
+    out = {}
+    try:
+        r = requests.get(f"http://{ip}/cgi-bin/get_system_info.cgi", auth=auth, timeout=3)
+        if r.ok:
+            d = r.json()
+            if d.get("macaddr"):
+                out["mac"] = str(d["macaddr"]).upper()
+            if d.get("serinum"):
+                out["serial"] = d["serinum"]
+            if d.get("minertype"):
+                out["model"] = d["minertype"]
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def estimate_power(model: str, hashrate: float, ideal: float, measured: float) -> tuple[float, str]:
+    """Return (watts, source). measured > 0 wins. Otherwise a rough nameplate
+    estimate scaled by load. THIS IS THE HOOK for Graeson's ML power model —
+    drop the trained estimator in here and return ('<value>', 'ml')."""
+    if measured and measured > 0:
+        return float(measured), "measured"
+    rated = 0
+    for key, w in RATED_WATTS.items():
+        if key.lower() in (model or "").lower():
+            rated = w
+            break
+    if not rated:
+        return 0.0, "unknown"
+    if ideal and hashrate and ideal > 0:
+        return round(rated * min(1.15, max(0.0, hashrate / ideal)), 1), "estimated"
+    return float(rated), "estimated"
+
+
+def _find_power(d: dict) -> float:
+    """Best-effort watts from a cgminer summary/stats dict across firmwares."""
+    if not isinstance(d, dict):
+        return 0.0
+    for k, v in d.items():
+        kl = k.lower()
+        if ("power" in kl or "watt" in kl) and "rate" not in kl and "efficiency" not in kl:
+            try:
+                w = float(v)
+                if 50 < w < 20000:  # plausible single-miner wattage
+                    return w
+            except (TypeError, ValueError):
+                continue
+    return 0.0
 
 
 def get_stats(ip: str, auth: HTTPDigestAuth) -> dict:
@@ -188,12 +259,15 @@ def diagnose(ip: str, cfg: configparser.ConfigParser, auth: HTTPDigestAuth) -> d
 
     r = {
         "ip": ip, "ts": datetime.now(timezone.utc).isoformat(),
+        "mac": "00:00:00:00:00:00", "serial": "",
         "reachable": False, "model": "Unknown", "hashrate": 0.0, "ideal": 0.0,
         "accepted": 0, "rejected": 0, "elapsed": 0, "fans": [], "temp_max": 0.0,
+        "power_watts": 0.0, "power_source": "unknown",
         "pool": "", "worker": "", "pool_status": "",
         "state": "UNKNOWN", "severity": "info", "issue": None, "detail": "",
         "restartable": False,
     }
+    r["mac"] = get_mac(ip)
 
     ver = query_cgminer(ip, "version", port)
     if not ver:
@@ -206,6 +280,7 @@ def diagnose(ip: str, cfg: configparser.ConfigParser, auth: HTTPDigestAuth) -> d
     r["reachable"] = True
     r["model"] = ver.get("VERSION", [{}])[0].get("Type", "Unknown")
 
+    measured_power = 0.0
     summ = query_cgminer(ip, "summary", port)
     if summ:
         s = summ.get("SUMMARY", [{}])[0]
@@ -214,6 +289,7 @@ def diagnose(ip: str, cfg: configparser.ConfigParser, auth: HTTPDigestAuth) -> d
         r["rejected"] = int(s.get("Rejected", 0) or 0)
         r["elapsed"] = int(s.get("Elapsed", 0) or 0)
         r["ideal"] = float(s.get("rate_ideal", 0) or 0)
+        measured_power = _find_power(s)
 
     pools = query_cgminer(ip, "pools", port)
     if pools:
@@ -231,6 +307,18 @@ def diagnose(ip: str, cfg: configparser.ConfigParser, auth: HTTPDigestAuth) -> d
     if devs and "DEVS" in devs and not chains:
         chains = devs.get("DEVS", [])
     r["temp_max"] = extract_max_temp(stats, chains)
+    if not measured_power and stats:
+        measured_power = _find_power(stats)
+
+    # stable identity + power (measured if reported, else estimated/ML hook)
+    ident = get_ident(ip, auth)
+    if ident.get("mac"):
+        r["mac"] = ident["mac"]
+    if ident.get("serial"):
+        r["serial"] = ident["serial"]
+    if ident.get("model"):
+        r["model"] = ident["model"]
+    r["power_watts"], r["power_source"] = estimate_power(r["model"], r["hashrate"], r["ideal"], measured_power)
 
     elapsed_min = r["elapsed"] / 60
     dead_fans = [i + 1 for i, rpm in enumerate(r["fans"]) if rpm == 0]
@@ -471,6 +559,138 @@ def push_platform(m: dict, cfg: configparser.ConfigParser):
         log.debug("platform push failed for %s: %s", m["ip"], e)
 
 
+# ── HISTORY STORAGE (SQLite, MAC-keyed) ───────────────────────────────────────
+def db_connect(cfg: configparser.ConfigParser) -> sqlite3.Connection:
+    path = cfg.get("storage", "db", fallback="./mine-manager.db")
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS miners (
+            mac TEXT PRIMARY KEY,
+            serial TEXT, model TEXT, ip TEXT,
+            client TEXT, rated_watts REAL,
+            first_seen TEXT, last_seen TEXT
+        );
+        CREATE TABLE IF NOT EXISTS samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mac TEXT, ts TEXT, ip TEXT,
+            hashrate REAL, ideal REAL, accepted INTEGER, rejected INTEGER,
+            elapsed INTEGER, temp_max REAL,
+            power_watts REAL, power_source TEXT,
+            state TEXT, issue TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_samples_mac_ts ON samples(mac, ts);
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mac TEXT, ts TEXT, type TEXT, detail TEXT
+        );
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def persist(conn: sqlite3.Connection, fleet: list[dict]):
+    """Upsert miner identity and append one time-series sample per miner."""
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.cursor()
+    for m in fleet:
+        mac = m.get("mac") or "00:00:00:00:00:00"
+        if mac == "00:00:00:00:00:00":
+            # No stable identity — key on IP so we still capture something.
+            mac = f"ip:{m['ip']}"
+        cur.execute("SELECT mac FROM miners WHERE mac=?", (mac,))
+        if cur.fetchone():
+            cur.execute(
+                "UPDATE miners SET serial=COALESCE(NULLIF(?,''),serial), "
+                "model=COALESCE(NULLIF(?,''),model), ip=?, last_seen=? WHERE mac=?",
+                (m.get("serial", ""), m.get("model", ""), m["ip"], now, mac),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO miners(mac,serial,model,ip,first_seen,last_seen) VALUES(?,?,?,?,?,?)",
+                (mac, m.get("serial", ""), m.get("model", ""), m["ip"], now, now),
+            )
+        cur.execute(
+            "INSERT INTO samples(mac,ts,ip,hashrate,ideal,accepted,rejected,elapsed,"
+            "temp_max,power_watts,power_source,state,issue) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (mac, m["ts"], m["ip"], m["hashrate"], m["ideal"], m["accepted"], m["rejected"],
+             m["elapsed"], m["temp_max"], m["power_watts"], m["power_source"], m["state"], m["issue"]),
+        )
+    conn.commit()
+
+
+def log_event_db(conn: sqlite3.Connection, mac: str, etype: str, detail: str):
+    try:
+        conn.execute("INSERT INTO events(mac,ts,type,detail) VALUES(?,?,?,?)",
+                     (mac, datetime.now(timezone.utc).isoformat(), etype, detail))
+        conn.commit()
+    except sqlite3.Error:
+        pass
+
+
+def push_server(fleet: list[dict], cfg: configparser.ConfigParser):
+    """Optionally forward each sweep to a central server (e.g. Cole's dashboard
+    backend). Configure storage.server_push_url; off by default. Best-effort."""
+    url = cfg.get("storage", "server_push_url", fallback="").strip()
+    if not url:
+        return
+    token = os.environ.get(cfg.get("storage", "server_push_token_env", fallback="CT_SERVER_TOKEN"), "")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        requests.post(url, headers=headers,
+                      json={"site": cfg.get("site", "name"), "ts": datetime.now(timezone.utc).isoformat(),
+                            "miners": fleet}, timeout=10)
+    except Exception as e:  # noqa: BLE001
+        log.debug("server push failed: %s", e)
+
+
+def compute_billing(conn: sqlite3.Connection, cfg: configparser.ConfigParser,
+                    dt_from: str, dt_to: str) -> dict:
+    """Energy (kWh) and cost per client by integrating power over the samples in
+    [from, to). Uses real per-miner time deltas, capping gaps so downtime does
+    not over-bill."""
+    rate = cfg.getfloat("billing", "rate_per_kwh", fallback=0.10)
+    max_gap_s = cfg.getint("site", "scan_interval") * 3  # a gap larger than this = miner was off
+    cur = conn.cursor()
+    clients: dict[str, dict] = {}
+    per_miner: dict[str, dict] = {}
+    cur.execute("SELECT mac, COALESCE(client,'unassigned') FROM miners")
+    client_of = {row[0]: row[1] for row in cur.fetchall()}
+
+    cur.execute("SELECT DISTINCT mac FROM samples WHERE ts>=? AND ts<?", (dt_from, dt_to))
+    macs = [r[0] for r in cur.fetchall()]
+    for mac in macs:
+        cur.execute("SELECT ts, power_watts FROM samples WHERE mac=? AND ts>=? AND ts<? ORDER BY ts",
+                    (mac, dt_from, dt_to))
+        rows = cur.fetchall()
+        kwh = 0.0
+        prev_t = None
+        for ts, watts in rows:
+            try:
+                t = datetime.fromisoformat(ts)
+            except ValueError:
+                continue
+            if prev_t is not None and watts:
+                dt_s = min((t - prev_t).total_seconds(), max_gap_s)
+                if dt_s > 0:
+                    kwh += (watts * dt_s / 3600.0) / 1000.0
+            prev_t = t
+        client = client_of.get(mac, "unassigned")
+        per_miner[mac] = {"client": client, "kwh": round(kwh, 3), "cost": round(kwh * rate, 2)}
+        c = clients.setdefault(client, {"kwh": 0.0, "miners": 0})
+        c["kwh"] += kwh
+        c["miners"] += 1
+    for c in clients.values():
+        c["kwh"] = round(c["kwh"], 3)
+        c["cost"] = round(c["kwh"] * rate, 2)
+    return {"from": dt_from, "to": dt_to, "rate_per_kwh": rate,
+            "clients": clients, "per_miner": per_miner}
+
+
 # ── STATE (edge-triggered alerts + restart accounting) ────────────────────────
 STATE_FILE = "mine-manager-state.json"
 
@@ -535,7 +755,8 @@ def sweep(cfg: configparser.ConfigParser, auth: HTTPDigestAuth) -> list[dict]:
     return fleet
 
 
-def handle_alerts_and_ops(fleet: list[dict], state: dict, cfg: configparser.ConfigParser, auth: HTTPDigestAuth):
+def handle_alerts_and_ops(fleet: list[dict], state: dict, cfg: configparser.ConfigParser,
+                          auth: HTTPDigestAuth, conn: sqlite3.Connection | None = None):
     auto = cfg.getboolean("operations", "auto_restart")
     open_issues = {k: v for k, v in state.get("_issues", {}).items()}  # ip -> issue
 
@@ -545,10 +766,14 @@ def handle_alerts_and_ops(fleet: list[dict], state: dict, cfg: configparser.Conf
         # edge-triggered: new or changed issue
         if m["issue"] and m["issue"] != prev:
             notify(cfg, m["severity"], f"{ip}: {m['issue']}", m["detail"])
+            if conn:
+                log_event_db(conn, m.get("mac", ip), "issue_open", f"{m['issue']}: {m['detail']}")
             open_issues[ip] = m["issue"]
         # cleared
         elif not m["issue"] and prev:
             notify(cfg, "info", f"{ip}: RESOLVED ({prev})", "Miner is healthy again.")
+            if conn:
+                log_event_db(conn, m.get("mac", ip), "issue_clear", prev)
             open_issues.pop(ip, None)
 
         push_platform(m, cfg)
@@ -558,6 +783,8 @@ def handle_alerts_and_ops(fleet: list[dict], state: dict, cfg: configparser.Conf
             if can_restart(ip, state, cfg):
                 if reboot_miner(ip, cfg, auth, reason=m["issue"]):
                     record_restart(ip, state)
+                    if conn:
+                        log_event_db(conn, m.get("mac", ip), "reboot", f"auto: {m['issue']}")
                     notify(cfg, "warning", f"{ip}: auto-restarted", f"Reason: {m['issue']} — {m['detail']}")
 
     state["_issues"] = open_issues
@@ -573,13 +800,16 @@ def cmd_run(cfg, auth):
              cfg.get("operations", "dry_run"), cfg.get("operations", "auto_restart"))
     log.info("=" * 60)
     state = load_state()
+    conn = db_connect(cfg)
     interval = cfg.getint("site", "scan_interval")
     report_every = cfg.getint("reports", "interval_hours") * 3600
     last_report = 0.0
     while True:
         try:
             fleet = sweep(cfg, auth)
-            handle_alerts_and_ops(fleet, state, cfg, auth)
+            persist(conn, fleet)
+            push_server(fleet, cfg)
+            handle_alerts_and_ops(fleet, state, cfg, auth, conn)
             if cfg.getboolean("reports", "enabled") and (time.time() - last_report) >= report_every:
                 text, data = build_report(fleet, cfg)
                 write_report(text, data, cfg)
@@ -615,6 +845,55 @@ def cmd_set_pool(cfg, auth, args):
     print("pool change sent" if ok else "refused / no change — check log")
 
 
+def cmd_assign(cfg, args):
+    """Associate a miner (by MAC) with a client, for billing."""
+    conn = db_connect(cfg)
+    cur = conn.cursor()
+    cur.execute("SELECT mac FROM miners WHERE mac=?", (args.mac,))
+    if not cur.fetchone():
+        # allow pre-registering a miner we haven't swept yet
+        cur.execute("INSERT INTO miners(mac,first_seen,last_seen) VALUES(?,?,?)",
+                    (args.mac, datetime.now(timezone.utc).isoformat(),
+                     datetime.now(timezone.utc).isoformat()))
+    cur.execute("UPDATE miners SET client=COALESCE(?,client), rated_watts=COALESCE(?,rated_watts) WHERE mac=?",
+                (args.client, args.rated_watts, args.mac))
+    conn.commit()
+    row = cur.execute("SELECT mac,client,rated_watts,model FROM miners WHERE mac=?", (args.mac,)).fetchone()
+    print(f"assigned: mac={row[0]} client={row[1]} rated_watts={row[2]} model={row[3]}")
+
+
+def cmd_bill(cfg, args):
+    conn = db_connect(cfg)
+    dt_from = args.dt_from or "0000"
+    dt_to = args.dt_to or datetime.now(timezone.utc).isoformat()
+    result = compute_billing(conn, cfg, dt_from, dt_to)
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return
+    print(f"Billing {result['from']} .. {result['to']}  @ ${result['rate_per_kwh']}/kWh")
+    print("=" * 52)
+    print(f"{'CLIENT':<22}{'MINERS':>8}{'kWh':>12}{'COST':>10}")
+    for client, c in sorted(result["clients"].items(), key=lambda kv: -kv[1]["kwh"]):
+        print(f"{client:<22}{c['miners']:>8}{c['kwh']:>12.2f}{'$'+format(c['cost'],'.2f'):>10}")
+
+
+def cmd_history(cfg, args):
+    conn = db_connect(cfg)
+    cur = conn.cursor()
+    rows = cur.execute(
+        "SELECT ts,ip,hashrate,temp_max,power_watts,power_source,state,issue "
+        "FROM samples WHERE mac=? ORDER BY ts DESC LIMIT ?", (args.mac, args.limit)).fetchall()
+    if not rows:
+        print(f"no history for {args.mac}")
+        return
+    info = cur.execute("SELECT model,serial,client,first_seen FROM miners WHERE mac=?", (args.mac,)).fetchone()
+    if info:
+        print(f"{args.mac}  model={info[0]} serial={info[1]} client={info[2]} since={info[3]}")
+    print(f"{'TS':<28}{'IP':<16}{'HASH':>9}{'TEMP':>6}{'WATT':>8} SRC        STATE/ISSUE")
+    for ts, ip, hr, temp, w, src, state, issue in rows:
+        print(f"{ts:<28}{ip:<16}{hr:>9.0f}{temp:>6.0f}{w:>8.0f} {src:<10} {state}/{issue or '-'}")
+
+
 def main():
     setup_logging()
     ap = argparse.ArgumentParser(description="Cryptotherm Mine Manager")
@@ -630,6 +909,17 @@ def main():
     sp.add_argument("--user", required=True)
     sp.add_argument("--pass", dest="password", default="")
     sp.add_argument("--yes", action="store_true", help="skip interactive IP-retype confirmation")
+    asg = sub.add_parser("assign", help="map a miner MAC to a client (for billing)")
+    asg.add_argument("mac")
+    asg.add_argument("--client", default=None)
+    asg.add_argument("--rated-watts", dest="rated_watts", type=float, default=None)
+    bl = sub.add_parser("bill", help="energy + cost per client over a period")
+    bl.add_argument("--from", dest="dt_from", default=None, help="ISO start, e.g. 2026-09-01")
+    bl.add_argument("--to", dest="dt_to", default=None, help="ISO end (default: now)")
+    bl.add_argument("--json", action="store_true")
+    hi = sub.add_parser("history", help="recent samples for one miner MAC")
+    hi.add_argument("mac")
+    hi.add_argument("--limit", type=int, default=20)
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -647,6 +937,12 @@ def main():
         cmd_restart(cfg, auth, args.ip)
     elif cmd == "set-pool":
         cmd_set_pool(cfg, auth, args)
+    elif cmd == "assign":
+        cmd_assign(cfg, args)
+    elif cmd == "bill":
+        cmd_bill(cfg, args)
+    elif cmd == "history":
+        cmd_history(cfg, args)
 
 
 if __name__ == "__main__":
