@@ -33,6 +33,10 @@ restart_max_per_day  = 3      # per-miner daily cap on auto-restarts
 allow_pool_changes = false
 approved_pools     =          # comma-separated stratum URLs allowed as targets
 
+# Let the central server queue a reboot for a miner (Dashboard "restart").
+# Opt-in; honors dry_run + cooldown/cap; only 'restart' — never pool changes.
+accept_remote_commands = false
+
 [thresholds]
 warmup_min     = 15           # grace period before a low/no-hash miner is judged
 dead_after_min = 15           # reachable but ~0 hashrate this long => HUNG (restart candidate)

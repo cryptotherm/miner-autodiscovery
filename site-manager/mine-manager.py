@@ -53,7 +53,8 @@ DEFAULTS = {
     "auth":       {"miner_user": "root", "miner_pass": "root"},
     "operations": {"dry_run": "true", "auto_restart": "false", "restart_method": "web",
                    "restart_cooldown_min": "30", "restart_max_per_day": "3",
-                   "allow_pool_changes": "false", "approved_pools": ""},
+                   "allow_pool_changes": "false", "approved_pools": "",
+                   "accept_remote_commands": "false"},
     "thresholds": {"warmup_min": "15", "dead_after_min": "15", "temp_warn_c": "80", "temp_crit_c": "95"},
     "notify":     {"webhook_url": "", "min_severity": "warning", "email_to": "",
                    "smtp_host": "", "smtp_port": "587", "smtp_user": "", "smtp_pass_env": "CT_SMTP_PASS"},
@@ -635,17 +636,40 @@ def push_server(fleet: list[dict], cfg: configparser.ConfigParser):
     backend). Configure storage.server_push_url; off by default. Best-effort."""
     url = cfg.get("storage", "server_push_url", fallback="").strip()
     if not url:
-        return
+        return {}
     token = os.environ.get(cfg.get("storage", "server_push_token_env", fallback="CT_SERVER_TOKEN"), "")
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     try:
-        requests.post(url, headers=headers,
-                      json={"site": cfg.get("site", "name"), "ts": datetime.now(timezone.utc).isoformat(),
-                            "miners": fleet}, timeout=10)
+        resp = requests.post(url, headers=headers,
+                             json={"site": cfg.get("site", "name"), "ts": datetime.now(timezone.utc).isoformat(),
+                                   "miners": fleet}, timeout=10)
+        return resp.json() if resp.ok else {}
     except Exception as e:  # noqa: BLE001
         log.debug("server push failed: %s", e)
+        return {}
+
+
+def run_remote_commands(resp: dict, cfg: configparser.ConfigParser, auth: HTTPDigestAuth,
+                        state: dict, conn: "sqlite3.Connection | None"):
+    """Execute restart commands the server queued. Opt-in and guarded: only when
+    operations.accept_remote_commands=true, only 'restart', never pool changes,
+    and subject to the same cooldown/cap/dry_run as auto-restart."""
+    if not cfg.getboolean("operations", "accept_remote_commands", fallback=False):
+        return
+    for c in (resp or {}).get("commands", []):
+        if c.get("type") != "restart":
+            continue  # remote pool changes are intentionally not honored
+        ip = c.get("ip")
+        if not ip:
+            continue
+        if can_restart(ip, state, cfg) and reboot_miner(ip, cfg, auth, reason="remote command"):
+            record_restart(ip, state)
+            if conn:
+                log_event_db(conn, c.get("mac", ip), "reboot", "remote command")
+            notify(cfg, "warning", f"{ip}: remote restart", "Executed a restart queued from the server.")
+    save_state(state)
 
 
 def compute_billing(conn: sqlite3.Connection, cfg: configparser.ConfigParser,
@@ -808,7 +832,8 @@ def cmd_run(cfg, auth):
         try:
             fleet = sweep(cfg, auth)
             persist(conn, fleet)
-            push_server(fleet, cfg)
+            resp = push_server(fleet, cfg)
+            run_remote_commands(resp, cfg, auth, state, conn)
             handle_alerts_and_ops(fleet, state, cfg, auth, conn)
             if cfg.getboolean("reports", "enabled") and (time.time() - last_report) >= report_every:
                 text, data = build_report(fleet, cfg)
