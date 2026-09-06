@@ -1,0 +1,5 @@
+# Never commit site secrets or runtime state.
+mine-manager.conf
+mine-manager-state.json
+mine-manager-audit.log
+reports/
