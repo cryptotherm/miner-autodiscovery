@@ -1,0 +1,7 @@
+# Never commit server secrets or runtime state.
+collector.conf
+collector.db
+collector.db-wal
+collector.db-shm
+__pycache__/
+*.pyc
