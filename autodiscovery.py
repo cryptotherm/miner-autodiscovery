@@ -7,21 +7,64 @@ Deploy on: CTHome, Alienware, Mac (any machine with network access)
 Requires: python3, brother_ql (on print host), requests
 """
 
-import json, time, subprocess, socket, logging, os, sys, hashlib
+import json, time, subprocess, socket, logging, os, sys, hashlib, configparser
 import requests
 from datetime import datetime
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
-PLATFORM_API   = "http://20.125.62.35:8080"
-PLATFORM_TOKEN = "xk_T_zkKCiJ0irn8gBK6csrztp7rsNzKPcefXbVCxWc"
-PRINTER_IP     = "10.0.0.119"        # QL-810W WiFi
-PRINT_HOST     = "10.0.0.248"        # CTHome — where brother_ql runs (or this host)
-SUBNET         = "10.0.0"
-SCAN_INTERVAL  = 30                  # seconds between sweeps
+# Values load from autodiscovery.conf (same directory or /opt/ct-autodiscovery)
+# with CT_* environment variables taking precedence. The platform token was
+# previously hardcoded here — in a PUBLIC repository — and must be rotated;
+# it now only ever comes from the conf file or the environment.
+
+def _load_config() -> dict:
+    cfg = configparser.ConfigParser()
+    here = os.path.dirname(os.path.abspath(__file__))
+    cfg.read([
+        os.path.join(here, "autodiscovery.conf"),
+        "/opt/ct-autodiscovery/autodiscovery.conf",
+        os.path.expanduser("~/.ct-autodiscovery/autodiscovery.conf"),
+    ])
+    d = cfg["discovery"] if cfg.has_section("discovery") else {}
+    g = cfg["logging"] if cfg.has_section("logging") else {}
+
+    def pick(env, key, default, section=d):
+        return os.environ.get(env) or (section.get(key) if section else None) or default
+
+    return {
+        "platform_api":   pick("CT_PLATFORM_API",   "platform_api",   "http://127.0.0.1:8080"),
+        "platform_token": pick("CT_PLATFORM_TOKEN", "platform_token", ""),
+        "printer_ip":     pick("CT_PRINTER_IP",     "printer_ip",     "10.0.0.119"),
+        "subnet":         pick("CT_SUBNET",         "subnet",         "10.0.0"),
+        "scan_interval":  int(pick("CT_SCAN_INTERVAL", "scan_interval", "30")),
+        "log_file":       pick("CT_LOG_FILE", "log_file", "/var/log/ct_autodiscovery.log", g),
+    }
+
+_CFG = _load_config()
+
+PLATFORM_API   = _CFG["platform_api"].rstrip("/")
+PLATFORM_TOKEN = _CFG["platform_token"]
+PRINTER_IP     = _CFG["printer_ip"]     # QL-810W WiFi
+SUBNET         = _CFG["subnet"]
+SCAN_INTERVAL  = _CFG["scan_interval"]  # seconds between sweeps
 CGMINER_PORT   = 4028
 CGMINER_TIMEOUT = 3
-STATE_FILE     = "/tmp/ct_discovered_miners.json"
-LOG_FILE       = "/var/log/ct_autodiscovery.log"
+LOG_FILE       = _CFG["log_file"]
+
+
+def _state_file() -> str:
+    """Persistent state location — /tmp lost every reboot, which made the
+    tool re-register and re-print labels for the entire fleet after a restart."""
+    for candidate in ("/var/lib/ct-autodiscovery", os.path.expanduser("~/.ct-autodiscovery")):
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            if os.access(candidate, os.W_OK):
+                return os.path.join(candidate, "discovered_miners.json")
+        except OSError:
+            continue
+    return "/tmp/ct_discovered_miners.json"
+
+STATE_FILE = _state_file()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -450,11 +493,45 @@ def miner_fingerprint(ip: str, mac: str) -> str:
     return hashlib.md5(f"{ip}:{mac}".encode()).hexdigest()[:8]
 
 # ── MAIN LOOP ─────────────────────────────────────────────────────────────────
+def finalize_miner(state: dict, fp: str, ip: str, mac: str, diag: dict):
+    """Register the miner with the platform, record state, print its label."""
+    miner_id, ct_id = get_or_create_miner(diag)
+    push_telemetry(miner_id, diag)
+
+    diag["ct_id"] = ct_id
+    diag["miner_id"] = miner_id
+    first_seen = state.get(fp, {}).get("first_seen", datetime.now().isoformat())
+    state[fp] = {
+        "ct_id": ct_id, "ip": ip, "mac": mac,
+        "test_result": diag["test_result"],
+        "model": diag.get("model", "?"),
+        "first_seen": first_seen,
+        "last_seen": datetime.now().isoformat(),
+    }
+    save_state(state)
+
+    log.info(f"  Printing CT label for {ct_id}...")
+    trigger_print(diag, ct_id)
+
+
 def main():
     log.info("=" * 60)
     log.info("Cryptotherm Auto-Discovery starting")
     log.info(f"Subnet: {SUBNET}.0/24  |  Interval: {SCAN_INTERVAL}s")
+    log.info(f"State file: {STATE_FILE}")
     log.info("=" * 60)
+    log.warning(
+        "NOTE: this standalone tool is DEPRECATED for the test bench — the "
+        "miner-testbench server's autoscan owns bench discovery (racks on "
+        "192.168.2-6.x). Use this only for the separate platform/CTOps fleet."
+    )
+    if not PLATFORM_TOKEN:
+        log.error(
+            "No platform token configured. Set platform_token in "
+            "autodiscovery.conf or CT_PLATFORM_TOKEN in the environment. "
+            "Exiting rather than registering miners unauthenticated."
+        )
+        sys.exit(1)
 
     state = load_state()  # {fingerprint: {ct_id, last_seen, test_result, ...}}
 
@@ -478,34 +555,39 @@ def main():
                 mac = get_mac(ip)
                 fp  = miner_fingerprint(ip, mac)
 
-                # New miner?
                 if fp not in state:
+                    # New miner
                     log.info(f"NEW MINER DETECTED: {ip} (MAC: {mac})")
                     diag = run_diagnostics(ip)
 
-                    # Wait up to 15 min for warmup if pending
                     if diag["test_result"] == "PENDING":
-                        log.info(f"  Miner warming up — waiting 10 min before final diagnosis...")
-                        time.sleep(600)
-                        diag = run_diagnostics(ip)
+                        # Don't block the whole scan loop while it warms up —
+                        # record it and re-diagnose on the next sweeps.
+                        log.info("  Miner warming up — will re-check on next sweep")
+                        state[fp] = {
+                            "ct_id": None, "ip": ip, "mac": mac,
+                            "test_result": "PENDING",
+                            "model": diag.get("model", "?"),
+                            "first_seen": datetime.now().isoformat(),
+                            "last_seen": datetime.now().isoformat(),
+                        }
+                        save_state(state)
+                    else:
+                        finalize_miner(state, fp, ip, mac, diag)
 
-                    miner_id, ct_id = get_or_create_miner(diag)
-                    push_telemetry(miner_id, diag)
-
-                    diag["ct_id"] = ct_id
-                    diag["miner_id"] = miner_id
-                    state[fp] = {
-                        "ct_id": ct_id, "ip": ip, "mac": mac,
-                        "test_result": diag["test_result"],
-                        "model": diag.get("model","?"),
-                        "first_seen": datetime.now().isoformat(),
-                        "last_seen": datetime.now().isoformat(),
-                    }
-                    save_state(state)
-
-                    # Print label
-                    log.info(f"  Printing CT label for {ct_id}...")
-                    trigger_print(diag, ct_id)
+                elif state[fp].get("test_result") == "PENDING":
+                    # Warming up from an earlier sweep — re-diagnose
+                    diag = run_diagnostics(ip)
+                    first_seen = state[fp].get("first_seen", datetime.now().isoformat())
+                    try:
+                        waited_min = (datetime.now() - datetime.fromisoformat(first_seen)).total_seconds() / 60
+                    except ValueError:
+                        waited_min = 999
+                    if diag["test_result"] != "PENDING" or waited_min >= 20:
+                        finalize_miner(state, fp, ip, mac, diag)
+                    else:
+                        state[fp]["last_seen"] = datetime.now().isoformat()
+                        save_state(state)
 
                 else:
                     # Known miner — update last seen
