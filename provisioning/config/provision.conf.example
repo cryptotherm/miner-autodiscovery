@@ -1,0 +1,38 @@
+# =====================================================================
+# Cryptotherm onboarding config.  Copy to  provision.conf  and fill in.
+#   cp provision.conf.example provision.conf
+# The scripts read this file if it sits next to them in config/.
+# provision.conf is git-ignored so real secrets never get committed.
+# =====================================================================
+
+# --- Tailscale --------------------------------------------------------
+# Generate an AUTH KEY in the admin console:
+#   https://login.tailscale.com/admin/settings/keys
+# Recommended: "Reusable" + "Ephemeral: off" + a short expiry, and tag it.
+# You can REVOKE it there the moment onboarding is done — much safer than
+# shipping a private SSH key on a stick.
+TS_AUTHKEY=""
+
+# Optional. Hostname to set on the machine (also its name on the tailnet).
+# Leave blank to keep the machine's current name.
+TS_HOSTNAME=""
+
+# Optional. Tailscale ACL tags to apply, comma-separated, e.g. "tag:ct-booth"
+# (the tag must exist in your tailnet ACLs and the auth key must be allowed
+# to assign it). Leave blank for an untagged, user-owned node.
+TS_TAGS=""
+
+# --- SSH --------------------------------------------------------------
+# 1 = install + enable an SSH server and authorize the public keys below.
+SSH_ENABLE=1
+
+# Local account that should receive the admin public key(s) in
+# ~/.ssh/authorized_keys.  Leave blank to auto-detect the user running the
+# provision (the invoking sudo user on Linux/mac, current user on Windows).
+ADMIN_USER=""
+
+# --- Optional: give this machine an OUTBOUND key -----------------------
+# Only if this box must itself SSH out to cthome/inference-3 (like the booth
+# does).  Drop a PRIVATE key file named  id_ct  into this config/ folder and
+# set this to 1.  Most machines being onboarded do NOT need this — leave 0.
+INSTALL_OUTBOUND_KEY=0

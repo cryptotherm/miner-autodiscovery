@@ -1,0 +1,17 @@
+# =====================================================================
+# Cryptotherm Collector — server config. Copy to collector.conf.
+# git-ignored so secrets stay out of the repo.
+# =====================================================================
+
+[server]
+host      = 0.0.0.0        # bind address; use the Tailscale IP to keep it private
+port      = 8090
+db        = ./collector.db
+# Write endpoints (/ingest, /api/assign, /api/command) require this bearer
+# token. Set the SAME value as CT_SERVER_TOKEN on each site's Mine Manager.
+# Read endpoints (dashboard, /api/fleet) are open for the trusted network.
+token_env = CT_SERVER_TOKEN
+
+[billing]
+rate_per_kwh    = 0.10     # $/kWh
+max_gap_seconds = 180      # gaps larger than this = miner was off (not billed)

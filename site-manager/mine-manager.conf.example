@@ -1,0 +1,82 @@
+# =====================================================================
+# Cryptotherm Mine Manager — site configuration.
+# Copy to  mine-manager.conf  and edit per site.  This file is git-ignored
+# so real secrets never get committed.  Secrets can also come from env vars
+# (preferred) — see the *_env keys below.
+# =====================================================================
+
+[site]
+name          = Colony-1
+subnet        = 10.0.0        # /24 the miners live on AT THIS SITE
+scan_interval = 60            # seconds between full-fleet sweeps
+cgminer_port  = 4028
+
+[auth]
+# Antminer web-admin credentials (used for stats + web reboot).
+miner_user = root
+miner_pass = root            # override per site; or set env CT_MINER_PASS
+
+[operations]
+# SAFETY FIRST. Defaults observe only and touch nothing.
+dry_run              = true   # true = never send restart/pool commands, just log what it WOULD do
+auto_restart         = false  # master switch for auto-rebooting hung miners
+restart_method       = web    # web  (reboot.cgi, most reliable on Antminer)  |  cgminer (API restart)
+restart_cooldown_min = 30     # minimum minutes between restarts of the SAME miner
+restart_max_per_day  = 3      # per-miner daily cap on auto-restarts
+# A miner with ANY dead fan is NEVER auto-restarted (thermal safety) — flagged only.
+
+# --- Pool changes are NEVER automatic. Manual CLI only, and gated by ALL of: ---
+#   1) allow_pool_changes = true
+#   2) the target pool URL present in approved_pools
+#   3) retyping the miner IP at the prompt
+#   4) passing --yes on the command line
+allow_pool_changes = false
+approved_pools     =          # comma-separated stratum URLs allowed as targets
+
+# Let the central server queue a reboot for a miner (Dashboard "restart").
+# Opt-in; honors dry_run + cooldown/cap; only 'restart' — never pool changes.
+accept_remote_commands = false
+
+[thresholds]
+warmup_min     = 15           # grace period before a low/no-hash miner is judged
+dead_after_min = 15           # reachable but ~0 hashrate this long => HUNG (restart candidate)
+temp_warn_c    = 80
+temp_crit_c    = 95
+
+[notify]
+# Leave blank to disable a channel. Console/log is always on.
+webhook_url   =               # Slack/Discord/generic incoming webhook (JSON POST)
+min_severity  = warning       # info | warning | critical  (floor for what gets sent)
+email_to      =
+smtp_host     =
+smtp_port     = 587
+smtp_user     =
+smtp_pass_env = CT_SMTP_PASS  # env var name holding the SMTP password
+
+[reports]
+enabled        = true
+interval_hours = 6
+dir            = ./reports
+deliver        = false        # also push each report to the notify channels
+
+[storage]
+# Per-miner history is kept in a local SQLite DB, keyed by MAC (stable identity),
+# so every miner has a full time-series (hashrate, temp, power, faults).
+db                    = ./mine-manager.db
+# Optional: forward every sweep to a central server (e.g. Cole's dashboard
+# backend) so history is queryable server-side. Leave blank to keep local-only.
+server_push_url       =
+server_push_token_env = CT_SERVER_TOKEN   # env var holding the server bearer token
+
+[billing]
+# Power consumed per miner is integrated from the samples above, grouped by the
+# client each miner is assigned to (see: mine-manager.py assign <mac> --client X).
+# Power is measured when the miner reports watts, otherwise estimated by model
+# (rough) — Graeson's ML power model is the intended drop-in (see estimate_power).
+rate_per_kwh = 0.10           # $/kWh used for cost; override per contract
+
+[platform]
+# Optional: push telemetry to the Cryptotherm platform API.
+enabled   = false
+api       = http://20.125.62.35:8080
+token_env = CT_PLATFORM_TOKEN # env var name holding the API token (never hardcode)
