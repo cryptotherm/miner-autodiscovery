@@ -43,12 +43,25 @@ install-windows.bat
 
 ## Config
 
-Edit `autodiscovery.conf`:
+Edit `autodiscovery.conf` (now actually loaded by the script; hardcoded
+values are only fallbacks):
 - `platform_api` — platform API URL
 - `platform_token` — auth token
 - `printer_ip` — QL-810W IP (currently `10.0.0.119`)
 - `subnet` — network to scan (currently `10.0.0`)
 - `scan_interval` — seconds between sweeps (default 30)
+- `known_pools` — pool URL substrings we operate; unknown pools are flagged
+  for tagging in the platform GUI
+- `approved_firmware` — firmware families allowed on outgoing units
+  (default `stock, braiins, luxos`); anything else (e.g. Vnish) is flagged
+  `needs_reflash`
+
+## Firmware
+
+Autodiscovery detects the firmware family on every unit (stock / Braiins OS /
+LuxOS / Vnish) and reports it in registration + telemetry and on the printed
+label. See [FIRMWARE.md](FIRMWARE.md) for the model/firmware compatibility
+matrix (S21 family, WhatsMiner M5x/M6x) and download sources.
 
 ## State
 
